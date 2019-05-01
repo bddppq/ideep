@@ -1318,7 +1318,7 @@ struct convolution_forward: public computation,
   };
 
  public:
-  using computation::expected_input_descriptor;
+  using computation::expected_src_descriptor;
   using computation::expected_dst_descriptor;
   using computation::expected_weights_descriptor;
   using cn_t = typename utils::computation_web::node<tensor>::cn_t;
@@ -2251,11 +2251,92 @@ struct convolution_forward: public computation,
         && aprop_kind == prop_kind::forward_inference) {
       apkind = prop_kind::forward;
     }
-
-    convolution_forward comp(x_desc, weights_desc, y_desc,
+    key_t key;
+    utils::create_key(key, x_dims, x_dtype, weights_dims, dtype, y_dims, y_dtype,
+        strides, dilates, padding_l, padding_r,
+        descriptor::attr_t(), aalgorithm, apkind);
+    fetch_or_create_m(comp, key, x_desc, weights_desc, y_desc,
         strides, dilates, padding_l, padding_r,
         descriptor::attr_t(), aalgorithm, apkind);
     return comp.dup_weights_descriptor();
+  }
+
+  static tensor::descriptor expected_src_descriptor(
+      const tensor::dims& weights_dims,
+      tensor::data_type dtype = tensor::data_type::f32,
+      const tensor::dims& strides = {1, 1},
+      const tensor::dims& padding_l = {0, 0},
+      const tensor::dims& padding_r = {0, 0},
+      const tensor::dims& dilates = {0, 0},
+      int group = 1,
+      algorithm aalgorithm = algorithm::convolution_direct,
+      prop_kind aprop_kind = prop_kind::forward,
+      tensor::data_type x_dtype = tensor::data_type::f32,
+      const tensor::dims& src_dims = tensor::dims()) {
+    auto dims_in = weights_dims;
+    if (group > 1 && !IDEEP_IS_GROUPED_4DIMS(dims_in)) {
+      tensor::group_dims(dims_in, group);
+    }
+    auto ndims = dims_in.size();
+    auto grouped = IDEEP_IS_GROUPED_4DIMS(dims_in);
+    auto g = grouped ? dims_in[0] : 1;
+
+    tensor::dims dilates_in {0, 0};
+    if (!dilates.empty() && !IDEEP_STD_ANY_LE(dilates, 0)) {
+      dilates_in = dilates;
+      IDEEP_STD_EACH_SUB(dilates_in, 1);
+    }
+
+    IDEEP_ENFORCE(!(aalgorithm == algorithm::convolution_winograd
+          && src_dims.empty()), "Incorrect src_dims");
+    auto ic = g * dims_in[1 + grouped];
+    auto oc = g * dims_in[0 + grouped];
+    auto kh = dims_in[ndims - 2];
+    auto kw = dims_in[ndims - 1];
+    int mb, h, w;
+    if (src_dims.empty()) {
+      // Construct a dummy case
+      mb = 1;
+      h = 2 * kh;
+      w = 4 * kw;
+    } else {
+      // Use the real data
+      mb = src_dims[0];
+      h = src_dims[2];
+      w = src_dims[3];
+    }
+    auto oh =
+      (h - ((kh - 1) * (dilates_in[0] + 1) + 1)
+       + (padding_l[0] + padding_r[0])) / strides[0] + 1;
+    auto ow =
+      (w - ((kw - 1) * (dilates_in[1] + 1) + 1)
+       + (padding_l[1] + padding_r[1])) / strides[1] + 1;
+
+    tensor::dims x_dims = { mb, ic, h, w};
+    tensor::dims y_dims = { mb, oc, oh, ow};
+    auto y_dtype = (dtype != tensor::data_type::s8)
+      ? dtype : tensor::data_type::s32;
+    tensor::descriptor x_desc(x_dims, x_dtype, format::nchw);
+    tensor::descriptor y_desc(y_dims, y_dtype, format::nchw);
+    tensor::descriptor weights_desc(dims_in, dtype,
+        grouped ? format::goihw : format::oihw);
+
+    // FIXME: workaroud winograd format issue in inference
+    auto apkind = aprop_kind;
+    if (aalgorithm == algorithm::convolution_winograd
+        && aprop_kind == prop_kind::forward_inference) {
+      apkind = prop_kind::forward;
+    }
+
+    key_t key;
+    utils::create_key(key, x_dims, x_dtype, weights_dims, dtype, y_dims, y_dtype,
+        strides, dilates, padding_l, padding_r,
+        descriptor::attr_t(), aalgorithm, apkind);
+
+    fetch_or_create_m(comp, key, x_desc, weights_desc, y_desc,
+        strides, dilates, padding_l, padding_r,
+        descriptor::attr_t(), aalgorithm, apkind);
+    return comp.dup_src_descriptor();
   }
 
   tensor& zero_bias() {
